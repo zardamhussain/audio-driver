@@ -22,6 +22,9 @@ Abstract:
 #include "micarray1toptable.h"
 #include "micarraywavtable.h"
 
+#include "loopbacktoptable.h"
+#include "loopbackwavtable.h"
+
 
 NTSTATUS
 CreateMiniportWaveRTSimpleAudioSample
@@ -141,6 +144,48 @@ ENDPOINT_MINIPAIR MicArray1Miniports =
     ENDPOINT_NO_FLAGS,
 };
 
+/*********************************************************************
+* Topology/Wave bridge connection for loopback                       *
+*                                                                    *
+*              +------+    +------+                                  *
+*              | Wave |    | Topo |                                  *
+*              |      |    |      |                                  *
+* SpeakerOut--->|0    1|===>|0    1|---> Loopback Capture Host Pin    *
+*              |      |    |      |                                  *
+*              +------+    +------+                                  *
+*********************************************************************/
+static
+PHYSICALCONNECTIONTABLE LoopbackTopologyPhysicalConnections[] =
+{
+    {
+        KSPIN_TOPO_WAVEOUT_SOURCE,  // Speaker Wave Out (Source)
+        KSPIN_WAVE_BRIDGE,          // Loopback Wave In (Bridge)
+        CONNECTIONTYPE_WAVE_OUTPUT
+    }
+};
+
+static
+ENDPOINT_MINIPAIR LoopbackMiniports =
+{
+    eLoopbackDevice,
+    L"TopologyLoopback",
+    NULL,
+    CreateMiniportTopologySimpleAudioSample,
+    &LoopbackTopoMiniportFilterDescriptor,
+    0, NULL,
+    L"WaveLoopback",
+    NULL,
+    CreateMiniportWaveRTSimpleAudioSample,
+    &LoopbackWaveMiniportFilterDescriptor,
+    0,
+    NULL,
+    LOOPBACK_MAX_CHANNELS,
+    LoopbackPinDeviceFormatsAndModes,
+    SIZEOF_ARRAY(LoopbackPinDeviceFormatsAndModes),
+    LoopbackTopologyPhysicalConnections,
+    SIZEOF_ARRAY(LoopbackTopologyPhysicalConnections),
+    ENDPOINT_NO_FLAGS,
+};
 
 //=============================================================================
 //
@@ -164,6 +209,7 @@ static
 PENDPOINT_MINIPAIR  g_CaptureEndpoints[] =
 {
     &MicArray1Miniports,
+    &LoopbackMiniports,
 };
 
 #define g_cCaptureEndpoints (SIZEOF_ARRAY(g_CaptureEndpoints))
