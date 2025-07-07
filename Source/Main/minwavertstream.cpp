@@ -92,6 +92,18 @@ Return Value:
          );
     }
 
+    // Free circular buffers
+    if (m_pMicCircularBuffer)
+    {
+        ExFreePoolWithTag(m_pMicCircularBuffer, MINWAVERTSTREAM_POOLTAG);
+        m_pMicCircularBuffer = NULL;
+    }
+    if (m_pSpeakerCircularBuffer)
+    {
+        ExFreePoolWithTag(m_pSpeakerCircularBuffer, MINWAVERTSTREAM_POOLTAG);
+        m_pSpeakerCircularBuffer = NULL;
+    }
+
     // Since we just cancelled the notification timer, wait for all queued 
     // DPCs to complete before we free the notification DPC.
     //
@@ -210,8 +222,8 @@ Return Value:
     m_hnsElapsedTimeCarryForward = 0;
     m_ullLastDPCTimeStamp = 0;
     m_hnsDPCTimeCarryForward = 0;
-    m_ulDmaMovementRate = 0;
     m_byteDisplacementCarryForward = 0;
+    m_ulDmaMovementRate = 0;
     m_bLfxEnabled = FALSE;
     m_pbMuted = NULL;
     m_plVolumeLevel = NULL;
@@ -227,11 +239,19 @@ Return Value:
     m_SignalProcessingMode = SignalProcessingMode;
     m_bEoSReceived = FALSE;
     m_bLastBufferRendered = FALSE;
+    
+    // Initialize circular buffer members
+    m_pMicCircularBuffer = NULL;
+    m_ulMicBufferSize = 0;
+    m_ulMicBufferReadPos = 0;
+    m_ulMicBufferWritePos = 0;
+    KeInitializeSpinLock(&m_MicBufferLock);
 
-    m_ulHostCaptureToneFrequency = IsEqualGUID(SignalProcessingMode, AUDIO_SIGNALPROCESSINGMODE_RAW) ? 1000 : 2000;
-    m_dwHostCaptureToneAmplitude = 50;
-    m_dwHostCaptureToneDCOffset = 0;
-    m_dwHostCaptureToneInitialPhase = 0;
+    m_pSpeakerCircularBuffer = NULL;
+    m_ulSpeakerBufferSize = 0;
+    m_ulSpeakerBufferReadPos = 0;
+    m_ulSpeakerBufferWritePos = 0;
+    KeInitializeSpinLock(&m_SpeakerBufferLock);
 
     m_pPortStream = PortStream_;
     InitializeListHead(&m_NotificationList);
@@ -300,6 +320,27 @@ Return Value:
     {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
+
+    // Allocate circular buffers for mic and speaker
+    // Using a fixed size for simplicity for now, adjust as needed.
+    m_ulMicBufferSize = PAGE_SIZE * 4; // Example size, adjust based on your needs
+    m_pMicCircularBuffer = (BYTE*)ExAllocatePool2(POOL_FLAG_NON_PAGED, m_ulMicBufferSize, MINWAVERTSTREAM_POOLTAG);
+    if (!m_pMicCircularBuffer)
+    {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    RtlZeroMemory(m_pMicCircularBuffer, m_ulMicBufferSize);
+
+    m_ulSpeakerBufferSize = PAGE_SIZE * 4; // Example size, adjust based on your needs
+    m_pSpeakerCircularBuffer = (BYTE*)ExAllocatePool2(POOL_FLAG_NON_PAGED, m_ulSpeakerBufferSize, MINWAVERTSTREAM_POOLTAG);
+    if (!m_pSpeakerCircularBuffer)
+    {
+        // Clean up mic buffer if speaker buffer allocation fails
+        ExFreePoolWithTag(m_pMicCircularBuffer, MINWAVERTSTREAM_POOLTAG);
+        m_pMicCircularBuffer = NULL;
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    RtlZeroMemory(m_pSpeakerCircularBuffer, m_ulSpeakerBufferSize);
 
     if (m_bCapture)
     {
@@ -1332,42 +1373,73 @@ VOID CMiniportWaveRTStream::UpdatePosition
 
     if (m_bCapture)
     {
-        // Write sine wave to buffer.
-        WriteBytes(ByteDisplacement);
+        // Read from m_pMicCircularBuffer
+        if (ByteDisplacement > 0)
+        {
+            KIRQL oldIrql;
+            KeAcquireSpinLock(&m_MicBufferLock, &oldIrql);
+
+            ULONG bytesAvailable = (m_ulMicBufferWritePos >= m_ulMicBufferReadPos) ?
+                                    (m_ulMicBufferWritePos - m_ulMicBufferReadPos) :
+                                    (m_ulMicBufferSize - m_ulMicBufferReadPos + m_ulMicBufferWritePos);
+
+            ULONG bytesToCopy = MIN(ByteDisplacement, bytesAvailable);
+
+            if (bytesToCopy > 0)
+            {
+                ULONG bytesToEnd = m_ulMicBufferSize - m_ulMicBufferReadPos;
+                if (bytesToEnd >= bytesToCopy)
+                {
+                    RtlCopyMemory(m_pDmaBuffer, m_pMicCircularBuffer + m_ulMicBufferReadPos, bytesToCopy);
+                    m_ulMicBufferReadPos = (m_ulMicBufferReadPos + bytesToCopy) % m_ulMicBufferSize;
+                }
+                else
+                {
+                    RtlCopyMemory(m_pDmaBuffer, m_pMicCircularBuffer + m_ulMicBufferReadPos, bytesToEnd);
+                    RtlCopyMemory(m_pDmaBuffer + bytesToEnd, m_pMicCircularBuffer, bytesToCopy - bytesToEnd);
+                    m_ulMicBufferReadPos = (bytesToCopy - bytesToEnd);
+                }
+            }
+            else
+            {
+                // No data in circular buffer, fill with silence
+                RtlZeroMemory(m_pDmaBuffer, ByteDisplacement);
+            }
+
+            KeReleaseSpinLock(&m_MicBufferLock, oldIrql);
+        }
     }
     else
     {
-
-        if (m_bEoSReceived)
+        // Write to m_pSpeakerCircularBuffer
+        if (ByteDisplacement > 0)
         {
-            // since EoS flag is set, we'll need to make sure not to read data beyond EOS position.
-            // If driver's current position is less than EoS position, then make sure not to read data beyond EoS.
-            if (m_ullWritePosition <= m_ulCurrentWritePosition)
+            KIRQL oldIrql;
+            KeAcquireSpinLock(&m_SpeakerBufferLock, &oldIrql);
+
+            ULONG freeSpace = (m_ulSpeakerBufferReadPos > m_ulSpeakerBufferWritePos) ?
+                              (m_ulSpeakerBufferReadPos - m_ulSpeakerBufferWritePos - 1) : 
+                              (m_ulSpeakerBufferSize - m_ulSpeakerBufferWritePos + m_ulSpeakerBufferReadPos - 1);
+
+            ULONG bytesToCopy = MIN(ByteDisplacement, freeSpace);
+
+            if (bytesToCopy > 0)
             {
-                ByteDisplacement = min(ByteDisplacement, m_ulCurrentWritePosition - (ULONG)m_ullWritePosition);
-            }
-            // If our current position is ahead of EoS position and we'll wrap around after new position then adjust
-            // new position if it crosses EoS.
-            else if ((m_ullWritePosition + ByteDisplacement) % m_ulDmaBufferSize < m_ullWritePosition)
-            {
-                if ((m_ullWritePosition + ByteDisplacement) % m_ulDmaBufferSize > m_ulCurrentWritePosition)
+                ULONG bytesToEnd = m_ulSpeakerBufferSize - m_ulSpeakerBufferWritePos;
+                if (bytesToEnd >= bytesToCopy)
                 {
-                    ByteDisplacement = ByteDisplacement - (((ULONG)m_ullWritePosition + ByteDisplacement) % m_ulDmaBufferSize - m_ulCurrentWritePosition);
+                    RtlCopyMemory(m_pSpeakerCircularBuffer + m_ulSpeakerBufferWritePos, m_pDmaBuffer, bytesToCopy);
+                    m_ulSpeakerBufferWritePos = (m_ulSpeakerBufferWritePos + bytesToCopy) % m_ulSpeakerBufferSize;
+                }
+                else
+                {
+                    RtlCopyMemory(m_pSpeakerCircularBuffer + m_ulSpeakerBufferWritePos, m_pDmaBuffer, bytesToEnd);
+                    RtlCopyMemory(m_pSpeakerCircularBuffer, m_pDmaBuffer + bytesToEnd, bytesToCopy - bytesToEnd);
+                    m_ulSpeakerBufferWritePos = (bytesToCopy - bytesToEnd);
                 }
             }
-        }
 
-        // If the last packet was rendered(read in the sample driver's case), send out an etw event.
-        if (m_bEoSReceived && !m_bLastBufferRendered
-            && (m_ullWritePosition + ByteDisplacement) % m_ulDmaBufferSize == m_ulCurrentWritePosition)
-        {
-            m_bLastBufferRendered = TRUE;
-        }
-
-        if (!g_DoNotCreateDataFiles)
-        {
-            // Read from buffer and write to a file.
-            ReadBytes(ByteDisplacement);
+            KeReleaseSpinLock(&m_SpeakerBufferLock, oldIrql);
         }
     }
     

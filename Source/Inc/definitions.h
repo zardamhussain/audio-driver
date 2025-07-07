@@ -195,4 +195,28 @@ NTSTATUS PropertyHandler_GenericPin
 #include "common.h"
 #include "kshelper.h"
 
+#define MTCS_IOCTL_SUPPORT 1
+
+#if MTCS_IOCTL_SUPPORT
+// Function prototypes for our custom IOCTL handlers
+DRIVER_DISPATCH CSMTIOCtlCreate;
+DRIVER_DISPATCH CSMTIOCtlClose;
+DRIVER_DISPATCH CSMTIOCtlDeviceControl;
+
+// Global variable to store the original IRP_MJ_DEVICE_CONTROL dispatch routine
+// This will allow us to chain calls to the Port Class handler
+PDRIVER_DISPATCH g_pfnOriginalDeviceControl;
+
+// IOCTL GUID - Generate a new GUID for your driver
+// You can use a tool like 'uuidgen' or an online GUID generator to get a new one.
+// Example: {05513b4d-6462-45e1-8cbd-0a43ac176b91}
+DEFINE_GUID(GUID_DEVINTERFACE_MTCS_AUDIO_BACKDOOR, 
+0x05513b4d, 0x6462, 0x45e1, 0x8c, 0xbd, 0x0a, 0x43, 0xac, 0x17, 0x6b, 0x91);
+
+// Custom IOCTL codes
+#define IOCTL_MTCS_MIC_WRITE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x900, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_MTCS_SPEAKER_READ CTL_CODE(FILE_DEVICE_UNKNOWN, 0x901, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+#endif // MTCS_IOCTL_SUPPORT
+
 #endif // _SIMPLEAUDIOSAMPLE_DEFINITIONS_H_

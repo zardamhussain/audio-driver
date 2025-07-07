@@ -317,7 +317,8 @@
     <ClCompile Include="mintopo.cpp" />
     <ClCompile Include="minwavert.cpp" />
     <ClCompile Include="minwavertstream.cpp" />
-    <ClCompile Include="newdelete.cpp" />
+    <ClCompile Include="NewDelete.cpp" />
+    <ClCompile Include="ioctl.cpp" />
     <ResourceCompile Include="SimpleAudioSample.rc" />
   </ItemGroup>
   <ItemGroup>

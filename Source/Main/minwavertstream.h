@@ -129,6 +129,20 @@ protected:
     DWORD                       m_dwLoopbackCaptureToneInitialPhase; // must be between -31416 to 31416
     // Member variable as config params for tone generator
 
+    // Backdoor IOCTL related members
+    BYTE*                       m_pMicCircularBuffer;       // Circular buffer for mic input
+    ULONG                       m_ulMicBufferSize;
+    ULONG                       m_ulMicBufferWritePos;
+    ULONG                       m_ulMicBufferReadPos;
+    KSPIN_LOCK                  m_MicBufferLock;
+
+    BYTE*                       m_pSpeakerCircularBuffer;   // Circular buffer for speaker output
+    ULONG                       m_ulSpeakerBufferSize;
+    ULONG                       m_ulSpeakerBufferWritePos;
+    ULONG                       m_ulSpeakerBufferReadPos;
+    KSPIN_LOCK                  m_SpeakerBufferLock;
+    // End of Backdoor IOCTL related members
+
 public:
 
     //presentation

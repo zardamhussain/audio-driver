@@ -119,6 +119,21 @@ Environment:
     {
         WdfDriverMiniportUnload(WdfGetDriver());
     }
+
+#if MTCS_IOCTL_SUPPORT
+    // Release the references to the miniport stream objects
+    if (g_pCaptureMiniportStream)
+    {
+        g_pCaptureMiniportStream->Release();
+        g_pCaptureMiniportStream = NULL;
+    }
+    if (g_pRenderMiniportStream)
+    {
+        g_pRenderMiniportStream->Release();
+        g_pRenderMiniportStream = NULL;
+    }
+#endif // MTCS_IOCTL_SUPPORT
+
 Done:
     return;
 }
@@ -316,6 +331,14 @@ Return Value:
         Done);
 
     //
+    // Store the original dispatch routine for IRP_MJ_DEVICE_CONTROL
+    // before Port Class initializes it, so we can chain our custom handler.
+    //
+#if MTCS_IOCTL_SUPPORT
+    g_pfnOriginalDeviceControl = DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL];
+#endif // MTCS_IOCTL_SUPPORT
+
+    //
     // Get registry configuration.
     //
     ntStatus = GetRegistrySettings(RegistryPathName);
@@ -339,6 +362,13 @@ Return Value:
     // To intercept stop/remove/surprise-remove.
     //
     DriverObject->MajorFunction[IRP_MJ_PNP] = PnpHandler;
+
+#if MTCS_IOCTL_SUPPORT
+    // Hook our custom IOCTL dispatch routines
+    DriverObject->MajorFunction[IRP_MJ_CREATE] = CSMTIOCtlCreate;
+    DriverObject->MajorFunction[IRP_MJ_CLOSE] = CSMTIOCtlClose;
+    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = CSMTIOCtlDeviceControl;
+#endif // MTCS_IOCTL_SUPPORT
 
     //
     // Hook the port class unload function
@@ -486,6 +516,18 @@ InstallEndpointRenderFilters(
 
     if (unknownWave) // IID_IPortClsEtwHelper and IID_IPortClsRuntimePower interfaces are only exposed on the WaveRT port.
     {
+        // Store the render stream for IOCTL access
+#if MTCS_IOCTL_SUPPORT
+        if (IsEqualGUIDAligned(*_pAeMiniports->pEndPointProperties->pKsPinDescriptor->Category, KSCATEGORY_AUDIO))
+        {
+            ntStatus = unknownWave->QueryInterface(IID_IMiniportWaveRTStream, (PVOID *)&g_pRenderMiniportStream);
+            if (!NT_SUCCESS(ntStatus))
+            {
+                DPF(D_ERROR, ("Failed to query IID_IMiniportWaveRTStream for render stream, 0x%x", ntStatus));
+            }
+        }
+#endif // MTCS_IOCTL_SUPPORT
+
         ntStatus = unknownWave->QueryInterface (IID_IPortClsEtwHelper, (PVOID *)&pPortClsEtwHelper);
         if (NT_SUCCESS(ntStatus))
         {
@@ -639,6 +681,123 @@ InstallEndpointCaptureFilters(
         NULL,
         NULL,
         NULL, NULL);
+
+    if (unknownWave) // IID_IPortClsEtwHelper and IID_IPortClsRuntimePower interfaces are only exposed on the WaveRT port.
+    {
+        // Store the capture stream for IOCTL access
+#if MTCS_IOCTL_SUPPORT
+        if (IsEqualGUIDAligned(*_pAeMiniports->pEndPointProperties->pKsPinDescriptor->Category, KSCATEGORY_AUDIO))
+        {
+            ntStatus = unknownWave->QueryInterface(IID_IMiniportWaveRTStream, (PVOID *)&g_pCaptureMiniportStream);
+            if (!NT_SUCCESS(ntStatus))
+            {
+                DPF(D_ERROR, ("Failed to query IID_IMiniportWaveRTStream for capture stream, 0x%x", ntStatus));
+            }
+        }
+#endif // MTCS_IOCTL_SUPPORT
+
+        ntStatus = unknownWave->QueryInterface(IID_IPortClsEtwHelper, (PVOID *)&pPortClsEtwHelper);
+        if (NT_SUCCESS(ntStatus))
+        {
+            _pAdapterCommon->SetEtwHelper(pPortClsEtwHelper);
+            ASSERT(pPortClsEtwHelper != NULL);
+            pPortClsEtwHelper->Release();
+        }
+
+#ifdef _USE_IPortClsRuntimePower
+        // Let's get the runtime power interface on PortCls.  
+        ntStatus = unknownWave->QueryInterface(IID_IPortClsRuntimePower, (PVOID *)&pPortClsRuntimePower);
+        if (NT_SUCCESS(ntStatus))
+        {
+            // This interface would typically be stashed away for later use.  Instead,
+            // let's just send an empty control with GUID_NULL.
+            NTSTATUS ntStatusTest =
+                pPortClsRuntimePower->SendPowerControl
+                (
+                    _pDeviceObject,
+                    &GUID_NULL,
+                    NULL,
+                    0,
+                    NULL,
+                    0,
+                    NULL
+                );
+
+            if (NT_SUCCESS(ntStatusTest) || STATUS_NOT_IMPLEMENTED == ntStatusTest || STATUS_NOT_SUPPORTED == ntStatusTest)
+            {
+                ntStatus = pPortClsRuntimePower->RegisterPowerControlCallback(_pDeviceObject, &PowerControlCallback, NULL);
+                if (NT_SUCCESS(ntStatus))
+                {
+                    ntStatus = pPortClsRuntimePower->UnregisterPowerControlCallback(_pDeviceObject);
+                }
+            }
+            else
+            {
+                ntStatus = ntStatusTest;
+            }
+
+            pPortClsRuntimePower->Release();
+        }
+#endif // _USE_IPortClsRuntimePower
+
+        //
+        // Test: add and remove current thread as streaming audio resource.  
+        // In a real driver you should only add interrupts and driver-owned threads 
+        // (i.e., do NOT add the current thread as streaming resource).
+        //
+        // testing IPortClsStreamResourceManager:
+        ntStatus = unknownWave->QueryInterface(IID_IPortClsStreamResourceManager, (PVOID *)&pPortClsResMgr);
+        if (NT_SUCCESS(ntStatus))
+        {
+            PCSTREAMRESOURCE_DESCRIPTOR res;
+            PCSTREAMRESOURCE hRes = NULL;
+            PDEVICE_OBJECT pdo = NULL;
+
+            PcGetPhysicalDeviceObject(_pDeviceObject, &pdo);
+            PCSTREAMRESOURCE_DESCRIPTOR_INIT(&res);
+            res.Pdo = pdo;
+            res.Type = ePcStreamResourceThread;
+            res.Resource.Thread = PsGetCurrentThread();
+            
+            NTSTATUS ntStatusTest = pPortClsResMgr->AddStreamResource(NULL, &res, &hRes);
+            if (NT_SUCCESS(ntStatusTest))
+            {
+                pPortClsResMgr->RemoveStreamResource(hRes);
+                hRes = NULL;
+            }
+
+            pPortClsResMgr->Release();
+            pPortClsResMgr = NULL;
+        }
+        
+        // testing IPortClsStreamResourceManager2:
+        ntStatus = unknownWave->QueryInterface(IID_IPortClsStreamResourceManager2, (PVOID *)&pPortClsResMgr2);
+        if (NT_SUCCESS(ntStatus))
+        {
+            PCSTREAMRESOURCE_DESCRIPTOR res;
+            PCSTREAMRESOURCE hRes = NULL;
+            PDEVICE_OBJECT pdo = NULL;
+
+            PcGetPhysicalDeviceObject(_pDeviceObject, &pdo);
+            PCSTREAMRESOURCE_DESCRIPTOR_INIT(&res);
+            res.Pdo = pdo;
+            res.Type = ePcStreamResourceThread;
+            res.Resource.Thread = PsGetCurrentThread();
+            
+            NTSTATUS ntStatusTest = pPortClsResMgr2->AddStreamResource2(pdo, NULL, &res, &hRes);
+            if (NT_SUCCESS(ntStatusTest))
+            {
+                pPortClsResMgr2->RemoveStreamResource(hRes);
+                hRes = NULL;
+            }
+
+            pPortClsResMgr2->Release();
+            pPortClsResMgr2 = NULL;
+        }
+    }
+
+    SAFE_RELEASE(unknownTopology);
+    SAFE_RELEASE(unknownWave);
 
     return ntStatus;
 }
